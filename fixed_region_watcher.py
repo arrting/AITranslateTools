@@ -40,6 +40,21 @@ SEPARATE_FILES = True
 BOOK_TITLE = "HIM"
 CHAPTER = "第五章"          # 章節編號行,必須是「第X章」格式(用來分組與辨識章節邊界)
 CHAPTER_TITLE = "衛斯(WES)"  # 章節副標題,會顯示在編號下一行;沒有的話留空字串 ""
+AUTO_CHAPTER = True        # 自動偵測章節頁(如「SIX / JAMIE」)並自動切章,不用手動改設定重啟
+NAME_GLOSSARY = {          # 這本書的人名/章節標題固定譯名(換書時換成新書的;不需要可清空成 {})
+    "Wes": "衛斯",
+    "Wesley": "衛斯理",
+    "Jamie": "傑米",
+    "Canning": "坎寧",
+    "Holly": "荷莉",
+    "Cassel": "卡塞爾",
+    "Blake": "布雷克",
+    "Rainier": "雷尼爾",
+    "April": "四月",
+    "June": "六月",
+    "July": "七月",
+    "August": "八月",
+}
 OCR_LANG = "en"            # OCR 辨識語言:英文 "en"、日文 "ja"(需安裝對應的 Windows OCR 語言套件)
 MIN_LENGTH = 20            # OCR 結果低於這個字元數視為辨識失敗/空白頁，不觸發翻譯
 GEMINI_MODEL = "gemini-3.5-flash"
@@ -88,15 +103,102 @@ def _is_junk_line(line: str) -> bool:
     return any(p.search(s) for p in _JUNK_LINE_RES)
 
 
-def ocr_image(img) -> str:
+def ocr_lines(img) -> list[str]:
     result = winocr.recognize_pil_sync(img, lang=OCR_LANG)
     lines = [l.get("text", "") for l in result.get("lines", [])]
     if not lines:
         lines = result.get("text", "").splitlines()
-    kept = [l for l in lines if not _is_junk_line(l)]
-    # 英文行與行之間用空格接;日文不用空格(日文書寫沒有詞間空格)
-    joiner = "" if OCR_LANG == "ja" else " "
-    return joiner.join(kept).strip()
+    return [l for l in lines if not _is_junk_line(l)]
+
+
+# ==== 章節頁自動偵測 ====
+_EN_UNITS = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5,
+             "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9}
+_EN_TEENS = {"TEN": 10, "ELEVEN": 11, "TWELVE": 12, "THIRTEEN": 13, "FOURTEEN": 14,
+             "FIFTEEN": 15, "SIXTEEN": 16, "SEVENTEEN": 17, "EIGHTEEN": 18, "NINETEEN": 19}
+_EN_TENS = {"TWENTY": 20, "THIRTY": 30, "FORTY": 40, "FIFTY": 50,
+            "SIXTY": 60, "SEVENTY": 70, "EIGHTY": 80, "NINETY": 90}
+_JP_CHAPTER_RE = re.compile(r"^(第[0-9〇一二三四五六七八九十百]+章)\s*(.*)$")
+
+
+def _parse_en_chapter_number(line: str):
+    """英文章節行 → 章節數字。支援「SIX」「CHAPTER 6」「CHAPTER SIX」「TWENTY-ONE」等,認不出回傳 None"""
+    s = line.strip().upper().strip(".:")
+    if not s or len(s) > 25:
+        return None
+    s = re.sub(r"^CHAPTER\s*", "", s)
+    if s.isdigit():
+        return int(s) if len(s) <= 3 else None
+    parts = re.split(r"[-\s]+", s)
+    if len(parts) == 1:
+        p = parts[0]
+        return _EN_UNITS.get(p) or _EN_TEENS.get(p) or _EN_TENS.get(p)
+    if len(parts) == 2 and parts[0] in _EN_TENS and parts[1] in _EN_UNITS:
+        return _EN_TENS[parts[0]] + _EN_UNITS[parts[1]]
+    return None
+
+
+def _to_chinese_num(n: int) -> str:
+    digits = "一二三四五六七八九"
+    if n <= 10:
+        return "十" if n == 10 else digits[n - 1]
+    if n < 20:
+        return "十" + digits[n % 10 - 1]
+    tens, unit = divmod(n, 10)
+    return digits[tens - 1] + "十" + (digits[unit - 1] if unit else "")
+
+
+def _translate_name(raw: str) -> str:
+    """章節副標的人名對照:在譯名表裡就用「譯名(原文)」,否則保留原文"""
+    for k, v in NAME_GLOSSARY.items():
+        if k.upper() == raw.upper():
+            return f"{v}({raw})"
+    return raw
+
+
+def _detect_chapter(lines: list[str]) -> list[str]:
+    """偵測頁面開頭是否為章節頁;是則自動更新 CHAPTER/CHAPTER_TITLE,並把標題行從內文剔除"""
+    global CHAPTER, CHAPTER_TITLE
+    if not AUTO_CHAPTER or not lines:
+        return lines
+
+    first = lines[0].strip()
+
+    # 日文書:章節頁直接是「第X章 標題」或 プロローグ/エピローグ
+    if OCR_LANG == "ja":
+        if first in ("プロローグ", "エピローグ", "序章", "終章"):
+            CHAPTER, CHAPTER_TITLE = first, ""
+            print(f"📑 偵測到新章節:{CHAPTER}")
+            return lines[1:]
+        m = _JP_CHAPTER_RE.match(first)
+        if m:
+            CHAPTER, CHAPTER_TITLE = m.group(1), m.group(2).strip()
+            print(f"📑 偵測到新章節:{CHAPTER} {CHAPTER_TITLE}")
+            return lines[1:]
+        return lines
+
+    # 英文書:章節頁第一行是數字(SIX / CHAPTER 6)或 PROLOGUE/EPILOGUE,下一行可能是副標(視角人名等)
+    specials = {"PROLOGUE": "序章", "EPILOGUE": "尾聲"}
+    if first.upper().strip(".:") in specials:
+        new_chapter = specials[first.upper().strip(".:")]
+    else:
+        num = _parse_en_chapter_number(first)
+        if num is None:
+            return lines
+        new_chapter = f"第{_to_chinese_num(num)}章"
+    rest = lines[1:]
+    title = ""
+    # 副標判斷:短、全大寫(Kindle 章節副標通常是「WES」「JAMIE」這種全大寫人名)
+    if rest:
+        cand = rest[0].strip()
+        if 0 < len(cand) <= 30 and cand.isupper():
+            title = _translate_name(cand)
+            rest = rest[1:]
+
+    if new_chapter != CHAPTER:
+        CHAPTER, CHAPTER_TITLE = new_chapter, title
+        print(f"📑 偵測到新章節:{CHAPTER} {CHAPTER_TITLE}")
+    return rest
 
 
 def _is_transient_error(e: Exception) -> bool:
@@ -108,10 +210,15 @@ def _is_transient_error(e: Exception) -> bool:
 def translate(text: str) -> tuple[str, str]:
     """呼叫 Gemini API 翻譯:主模型失敗自動重試,重試用盡自動換備援模型。
     回傳 (譯文, 實際使用的模型名稱)"""
+    glossary = ""
+    if NAME_GLOSSARY:
+        pairs = "、".join(f"{k}={v}" for k, v in NAME_GLOSSARY.items())
+        glossary = f"人名與專有名詞請固定使用以下譯名：{pairs}。表裡沒有的名字也請維持前後一致的譯法。"
     prompt = (
         "把這段內容翻譯成繁體中文（要通順）。"
         "原文因為 OCR 的關係失去了分段，請你依內容重新分段："
         "每句對話獨立成一行，敘事部分依語意適當分段，段落之間留一個空行。"
+        f"{glossary}"
         "只要譯文本身，不用任何前綴詞（例如不要寫「這段內容為您翻譯如下：」"
         "或任何說明、標題），直接給我翻譯後的繁體中文本文：\n\n"
         f"{text}"
@@ -142,8 +249,10 @@ def translate(text: str) -> tuple[str, str]:
     raise last_error
 
 
-# 章節邊界的辨識規則:整行只有「第X章」(X 為中文數字或阿拉伯數字)才算章節標題行
-_CHAPTER_LINE_RE = re.compile(r"(?m)^第[0-9一二三四五六七八九十百千零兩两]{1,6}章\s*$")
+# 章節邊界的辨識規則:整行只有「第X章」(或序章/尾聲等)才算章節標題行
+_CHAPTER_LINE_RE = re.compile(
+    r"(?m)^(第[0-9一二三四五六七八九十百千零兩两]{1,6}章|序章|尾聲|終章|プロローグ|エピローグ)\s*$"
+)
 
 
 def _chapter_heading() -> str:
@@ -202,9 +311,21 @@ def show_toast(original: str, translated: str):
         print(f"（通知彈窗顯示失敗：{e}）")
 
 
+def _already_recorded(text: str) -> bool:
+    """檢查這段原文是否已經在筆記檔裡(重啟程式後避免把同一頁再翻一次)"""
+    if not os.path.exists(NOTE_FILE):
+        return False
+    with open(NOTE_FILE, "r", encoding="utf-8") as f:
+        content = f.read()
+    return text[:120] in content
+
+
 def process_page(img, last_text: str):
     """OCR + 翻譯 + 寫入筆記 + 通知，回傳這次辨識到的文字（給主迴圈記錄用）"""
-    text = ocr_image(img)
+    lines = _detect_chapter(ocr_lines(img))
+    # 英文行與行之間用空格接;日文不用空格(日文書寫沒有詞間空格)
+    joiner = "" if OCR_LANG == "ja" else " "
+    text = joiner.join(lines).strip()
     if len(text) < MIN_LENGTH:
         print(f"⚠️ 辨識結果太短（{len(text)} 字），可能是翻頁動畫還沒跑完或空白頁，略過")
         return None
@@ -212,6 +333,10 @@ def process_page(img, last_text: str):
     if text == last_text:
         print("⚠️ 內容與上一頁相同（可能是同一頁上的反白/游標閃動），略過")
         return None
+
+    if _already_recorded(text):
+        print("⚠️ 筆記檔裡已經有這一頁的內容（之前翻過），略過")
+        return text
 
     print(f"🔍 辨識到 {len(text)} 字，翻譯中...")
     try:
@@ -229,8 +354,25 @@ def process_page(img, last_text: str):
         return "RETRY"
 
 
+def _resume_chapter_from_notes():
+    """啟動時從筆記檔讀出最後一個章節標題,自動接續(重啟後不用手動改設定)"""
+    global CHAPTER, CHAPTER_TITLE
+    if not os.path.exists(NOTE_FILE):
+        return
+    with open(NOTE_FILE, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if _CHAPTER_LINE_RE.match(lines[i]):
+            CHAPTER = lines[i].strip()
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            CHAPTER_TITLE = nxt  # 副標(緊接在章節編號下一行;沒有副標時該行為空)
+            print(f"📑 從筆記檔接續章節:{CHAPTER} {CHAPTER_TITLE}")
+            return
+
+
 def main():
     print("📖 自動偵測翻頁模式已啟動")
+    _resume_chapter_from_notes()
     print(f"監控範圍：{REGION}")
     if SEPARATE_FILES:
         print(f"原文將寫入：{NOTE_FILE}")
