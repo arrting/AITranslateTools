@@ -280,34 +280,44 @@ def translate(text: str) -> tuple[str, str]:
     raise last_error
 
 
+def _translate_split(sentences: list[str], joiner: str, depth: int = 0) -> str:
+    """翻譯一組句子;被擋就重試,重試不過就對半再切,直到單句仍被擋才保留原文"""
+    chunk = joiner.join(sentences)
+    last_error = None
+    for _ in range(2):  # 硬性過濾的判定時好時壞,同樣內容多試常常就過
+        try:
+            t, _ = translate(chunk)
+            return t
+        except TranslationBlocked as e:
+            last_error = e
+            continue
+        except Exception as e:
+            return f"（此段翻譯失敗：{e}，以下保留原文）\n\n{chunk}"
+    if len(sentences) > 1 and depth < 4:
+        mid = len(sentences) // 2
+        print(f"   ✂️ 段落仍被擋，對半再切（第 {depth + 1} 層）...")
+        left = _translate_split(sentences[:mid], joiner, depth + 1)
+        right = _translate_split(sentences[mid:], joiner, depth + 1)
+        return left + "\n\n" + right
+    print(f"   ⛔ 已切到最小仍被擋（{last_error}），保留原文")
+    return f"（此段被安全機制擋下：{last_error}，以下保留原文）\n\n{chunk}"
+
+
 def _translate_blocked_page(text: str) -> str:
-    """整頁被硬性過濾擋下時的補救:切成小段分別翻譯,只有真正觸發過濾的小段會留標記"""
+    """整頁被硬性過濾擋下時的補救:切成小段分別翻譯,卡住的段落自動越切越細"""
     if OCR_LANG == "ja":
         sentences = [s for s in re.split(r"(?<=[。！？])", text) if s.strip()]
         joiner = ""
     else:
         sentences = [s for s in re.split(r"(?<=[.!?\"”]) ", text) if s.strip()]
         joiner = " "
-    size = max(1, (len(sentences) + 3) // 4)  # 約略切成 4 段
-    chunks = [joiner.join(sentences[i:i + size]) for i in range(0, len(sentences), size)]
+    size = max(1, (len(sentences) + 3) // 4)  # 先約略切成 4 段
+    groups = [sentences[i:i + size] for i in range(0, len(sentences), size)]
 
     results = []
-    for idx, chunk in enumerate(chunks, 1):
-        # 硬性過濾的判定時好時壞,同樣內容多試幾次常常就過了
-        for attempt in range(3):
-            try:
-                t, _ = translate(chunk)
-                results.append(t)
-                break
-            except TranslationBlocked as e:
-                if attempt < 2:
-                    print(f"   ⛔ 第 {idx}/{len(chunks)} 段被擋（{e}），再試一次...")
-                    continue
-                print(f"   ⛔ 第 {idx}/{len(chunks)} 段連續被擋（{e}），保留原文")
-                results.append(f"（此段被安全機制擋下：{e}，以下保留原文）\n\n{chunk}")
-            except Exception as e:
-                results.append(f"（此段翻譯失敗：{e}，以下保留原文）\n\n{chunk}")
-                break
+    for idx, group in enumerate(groups, 1):
+        print(f"   🧩 分段翻譯 {idx}/{len(groups)}...")
+        results.append(_translate_split(group, joiner))
     return "\n\n".join(results)
 
 
