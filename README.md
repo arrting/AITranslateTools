@@ -1,0 +1,2 @@
+# AITranslateTools
+text Translate
