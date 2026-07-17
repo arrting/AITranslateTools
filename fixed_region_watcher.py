@@ -200,40 +200,72 @@ def _detect_chapter(lines: list[str]) -> list[str]:
     return rest
 
 
+class TranslationBlocked(Exception):
+    """模型拒絕輸出(安全過濾等),重試無效,應記錄後繼續"""
+
+
+# 翻譯自有書籍屬正當用途,把安全過濾整個關閉(OFF 比 BLOCK_NONE 更徹底,連評分都不跑),
+# 避免小說內容(親密場景等)被擋;Google 另有一層不可調整的核心過濾,由分段重試機制補救
+_SAFETY_OFF = [
+    types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.OFF)
+    for c in (
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    )
+]
+
+
 def _is_transient_error(e: Exception) -> bool:
     """503 過載 / 429 額度暫時超限,這類錯誤重試或換模型有機會成功"""
     msg = str(e)
     return any(k in msg for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded"))
 
 
-def translate(text: str) -> tuple[str, str]:
-    """呼叫 Gemini API 翻譯:主模型失敗自動重試,重試用盡自動換備援模型。
-    回傳 (譯文, 實際使用的模型名稱)"""
+def _system_instruction() -> str:
     glossary = ""
     if NAME_GLOSSARY:
         pairs = "、".join(f"{k}={v}" for k, v in NAME_GLOSSARY.items())
         glossary = f"人名與專有名詞請固定使用以下譯名：{pairs}。表裡沒有的名字也請維持前後一致的譯法。"
-    prompt = (
-        "把這段內容翻譯成繁體中文（要通順）。"
-        "原文因為 OCR 的關係失去了分段，請你依內容重新分段："
+    return (
+        "你是專業的小說譯者。使用者輸入的是已出版虛構小說的內文（可能包含親密或情感張力場景），"
+        "屬於正當的文學翻譯用途。請把內容翻譯成通順的繁體中文。"
+        "原文因 OCR 擷取失去了分段，請依內容重新分段："
         "每句對話獨立成一行，敘事部分依語意適當分段，段落之間留一個空行。"
         f"{glossary}"
-        "只要譯文本身，不用任何前綴詞（例如不要寫「這段內容為您翻譯如下：」"
-        "或任何說明、標題），直接給我翻譯後的繁體中文本文：\n\n"
-        f"{text}"
+        "只輸出譯文本身，不要任何前綴詞、說明或標題。"
     )
+
+
+def translate(text: str) -> tuple[str, str]:
+    """呼叫 Gemini API 翻譯:主模型失敗自動重試,重試用盡自動換備援模型。
+    回傳 (譯文, 實際使用的模型名稱)"""
     last_error = None
     for model in (GEMINI_MODEL, FALLBACK_MODEL):
         for attempt in range(1, RETRY_COUNT + 1):
             try:
                 resp = client.models.generate_content(
                     model=model,
-                    contents=prompt,
-                    # 關閉思考模式:翻譯不需要推理,關掉後回應速度大幅提升
+                    contents=text,
                     config=types.GenerateContentConfig(
-                        thinking_config=types.ThinkingConfig(thinking_budget=0)
+                        system_instruction=_system_instruction(),
+                        # 關閉思考模式:翻譯不需要推理,關掉後回應速度大幅提升
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        safety_settings=_SAFETY_OFF,
+                        temperature=0.3,  # 翻譯任務調低,譯文更穩定
                     ),
                 )
+                if resp.text is None:
+                    reason = ""
+                    try:
+                        if resp.candidates:
+                            reason = str(resp.candidates[0].finish_reason)
+                        elif resp.prompt_feedback:
+                            reason = str(resp.prompt_feedback.block_reason)
+                    except Exception:
+                        pass
+                    raise TranslationBlocked(reason or "模型未回傳內容")
                 return resp.text.strip(), model
             except Exception as e:
                 last_error = e
@@ -246,6 +278,37 @@ def translate(text: str) -> tuple[str, str]:
         if model == GEMINI_MODEL:
             print(f"   🔁 {GEMINI_MODEL} 持續過載，改用備援模型 {FALLBACK_MODEL}...")
     raise last_error
+
+
+def _translate_blocked_page(text: str) -> str:
+    """整頁被硬性過濾擋下時的補救:切成小段分別翻譯,只有真正觸發過濾的小段會留標記"""
+    if OCR_LANG == "ja":
+        sentences = [s for s in re.split(r"(?<=[。！？])", text) if s.strip()]
+        joiner = ""
+    else:
+        sentences = [s for s in re.split(r"(?<=[.!?\"”]) ", text) if s.strip()]
+        joiner = " "
+    size = max(1, (len(sentences) + 3) // 4)  # 約略切成 4 段
+    chunks = [joiner.join(sentences[i:i + size]) for i in range(0, len(sentences), size)]
+
+    results = []
+    for idx, chunk in enumerate(chunks, 1):
+        # 硬性過濾的判定時好時壞,同樣內容多試幾次常常就過了
+        for attempt in range(3):
+            try:
+                t, _ = translate(chunk)
+                results.append(t)
+                break
+            except TranslationBlocked as e:
+                if attempt < 2:
+                    print(f"   ⛔ 第 {idx}/{len(chunks)} 段被擋（{e}），再試一次...")
+                    continue
+                print(f"   ⛔ 第 {idx}/{len(chunks)} 段連續被擋（{e}），保留原文")
+                results.append(f"（此段被安全機制擋下：{e}，以下保留原文）\n\n{chunk}")
+            except Exception as e:
+                results.append(f"（此段翻譯失敗：{e}，以下保留原文）\n\n{chunk}")
+                break
+    return "\n\n".join(results)
 
 
 # 章節邊界的辨識規則:整行只有「第X章」(或序章/尾聲等)才算章節標題行
@@ -328,6 +391,9 @@ def process_page(img, last_text: str):
     if not text:
         print("⚠️ 這一頁沒有辨識到文字（空白頁/圖片頁），略過")
         return None
+    if text.lower().count("gemini") >= 3:
+        print("⚠️ 監控範圍似乎被其他視窗（終端機/瀏覽器）遮住了，略過。請確認 Kindle 沒被遮擋")
+        return None
     if len(text) < 20:
         # 章節結尾常有只剩一句話的頁面,照常翻譯,只提示一下
         print(f"ℹ️ 這一頁只有 {len(text)} 字（章節結尾的短頁很正常），照常處理")
@@ -346,6 +412,17 @@ def process_page(img, last_text: str):
         append_to_note(text, translated)
         show_toast(text, translated)
         print(f"✅ 已寫入筆記（模型：{used_model}），完整翻譯如下：")
+        print("─" * 60)
+        print(translated)
+        print("─" * 60 + "\n")
+        return text
+    except TranslationBlocked as e:
+        # 整頁被硬性過濾擋下:切小段分別翻譯補救,只有觸發過濾的小段會留標記
+        print(f"⚠️ 整頁翻譯被安全機制擋下（{e}），改用分段翻譯補救...")
+        translated = _translate_blocked_page(text)
+        append_to_note(text, translated)
+        show_toast(text, translated)
+        print("✅ 分段翻譯完成，已寫入筆記：")
         print("─" * 60)
         print(translated)
         print("─" * 60 + "\n")
