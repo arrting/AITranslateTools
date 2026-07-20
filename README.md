@@ -51,4 +51,4 @@ setx GEMINI_API_KEY "你的API金鑰"
 
 - Windows 10/11（OCR 使用 winocr、通知使用 win11toast）＋ 英文 OCR 語言套件
 - Python 3.9+
-- Gemini API Key（主模型 `gemini-3.5-flash`（已關思考模式），備援 `gemini-3.1-flash-lite`）
+- Gemini API Key（模型鏈 `gemini-3.1-pro-preview` → `gemini-3.5-flash` → `gemini-3.1-flash-lite`，過載或無權限時自動逐級退）
